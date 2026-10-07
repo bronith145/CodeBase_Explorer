@@ -1,0 +1,75 @@
+# Usage:
+#   CPU : docker compose --profile cpu up -d
+#   GPU : docker compose --profile gpu up -d   (needs NVIDIA Container Toolkit)
+# See docs/ADR/0002-docker-compose-infrastructure-and-gpu-profiles.md
+
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: cbx-neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-changeme-please}
+      NEO4J_server_memory_heap_max__size: 1G
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER:-neo4j} -p ${NEO4J_PASSWORD:-changeme-please} 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: cbx-qdrant
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # qdrant image has no curl/wget; use bash /dev/tcp
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /readyz HTTP/1.0\\r\\n\\r\\n\" >&3 && grep -q \"200\" <&3'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  ollama-cpu:
+    profiles: ["cpu"]
+    image: ollama/ollama:latest
+    container_name: cbx-ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      default:
+        aliases: [ollama]
+
+  ollama-gpu:
+    profiles: ["gpu"]
+    image: ollama/ollama:latest
+    container_name: cbx-ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      default:
+        aliases: [ollama]
+
+volumes:
+  neo4j_data:
+  qdrant_data:
+  ollama_data:
+

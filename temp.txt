@@ -1,5 +1,0 @@
-1. it should be a local model
-2.can be decided later but initally let it be a small repo
-3. as discussed above
-4.no let it be just public, keep it in future scope
-5. 
