@@ -1,0 +1,40 @@
+Yes, the main experience is a chat interface, similar to ChatGPT or Claude. It differs in two ways. A graph panel shows what the agent retrieved, and there is a separate page for adding repositories. The user first connects a codebase, then asks questions about it in chat.
+
+Your project doesn't get installed inside the other project. It runs as its own app, and the user points it at a codebase to ingest, as you'd add a project to a tool like SonarQube. There are a few ways to do that.
+
+1. Git URL (best default)
+The user pastes https://github.com/org/repo on the Repositories page, and the backend clones it and starts ingestion.
+
+Public repos work with no setup.
+For private repos, the user supplies a personal access token or deploy key, which you store as an environment variable or encrypted setting.
+
+2. Local folder (best for developers trying it on their own code)
+Because the backend runs inside Docker, it can't see the host's filesystem by default. The user mounts their project into the container, read-only:
+
+yaml
+# docker-compose.yml
+backend:
+  volumes:
+    - ${CODEBASE_DIR:-./sample-repo}:/workspace/repo:ro
+
+They set CODEBASE_DIR=/path/to/my/project in .env, and the UI then offers /workspace/repo as a source. The :ro flag means the tool can never modify their code.
+
+3. Zip upload (optional)
+The user drags a zip into the UI and the backend unpacks it into a temp folder. It's easy for non-technical users, but it's a convenience feature, so skip it in v1.
+
+Typical flow
+
+The user opens the Repositories page and clicks "Add repository".
+They pick Git URL or local folder.
+POST /repos starts a background ingestion job: Tree-sitter parses the code, Neo4j gets the graph, and Qdrant gets the embeddings.
+A progress bar shows the status (parsing, building graph, embedding).
+When it reads "Ready", the user switches to the chat and asks questions.
+
+Keeping the index fresh
+
+v1: a manual "Re-index" button. Hash each file so only changed files are reprocessed (ING-7 in the PRD).
+Later: a webhook from GitHub, a post-commit git hook, or a small CLI (explorer sync .) that CI can call after each merge. A GitHub App that comments the impact analysis on pull requests would make a strong future feature.
+
+The tool should only read and parse the code, never run it. Say so in your README, since people will be wary of pointing a tool at their private code.
+
+For the first version I'd support Git URL and local mount, since together they cover most users. I can write the ingestion endpoint and the docker-compose.yml for that setup if you'd like.
