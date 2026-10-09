@@ -18,7 +18,7 @@ COMMON_METHODS = {
 }
 MAX_HEURISTIC_CANDIDATES = 3
 MAX_REEXPORT_DEPTH = 5
-STDLIB = set(getattr(sys, "stdlib_module_names", ()))
+STDLIB_MODULES = set(getattr(sys, "stdlib_module_names", ()))
 
 
 @dataclass(frozen=True)
@@ -28,218 +28,254 @@ class Binding:
 
 
 class Resolver:
-    def __init__(self, parsed: list[ParsedFile]) -> None:
-        self.files = {pf.file_path: pf for pf in parsed}
+    def __init__(self, parsed_files: list[ParsedFile]) -> None:
+        self.files: dict[str, ParsedFile] = {parsed_file.file_path: parsed_file for parsed_file in parsed_files}
         self.modules: dict[str, str] = {
-            pf.module_qn: pf.file_path for pf in parsed if pf.module_qn
+            parsed_file.module_qn: parsed_file.file_path
+            for parsed_file in parsed_files
+            if parsed_file.module_qn
         }
+
+        # Index every module by each of its dotted suffixes for partial-match resolution.
         self.suffix_index: dict[str, list[str]] = defaultdict(list)
-        for m in self.modules:
-            parts = m.split(".")
-            for i in range(len(parts)):
-                self.suffix_index[".".join(parts[i:])].append(m)
+        for module_qn in self.modules:
+            module_parts = module_qn.split(".")
+            for start_index in range(len(module_parts)):
+                self.suffix_index[".".join(module_parts[start_index:])].append(module_qn)
 
-        self.by_qn: dict[str, list[Entity]] = defaultdict(list)
+        self.by_qualified_name: dict[str, list[Entity]] = defaultdict(list)
         self.methods_by_name: dict[str, list[Entity]] = defaultdict(list)
-        self._base_exprs: dict[str, tuple[ParsedFile, list[str]]] = {}
-        for pf in parsed:
-            for e in pf.entities:
-                self.by_qn[e.qualified_name].append(e)
-                if e.kind == "Function" and e.is_method:
-                    self.methods_by_name[e.name].append(e)
-            for b in pf.bases:
-                self._base_exprs.setdefault(b.class_qn, (pf, []))[1].append(b.expr)
+        # Maps class qualified name → (parsed file, list of raw base-class expressions)
+        self._base_expressions: dict[str, tuple[ParsedFile, list[str]]] = {}
 
-        self._bindings: dict[str, dict[str, Binding]] = {}
-        self._bases_cache: dict[str, list[str]] = {}
+        for parsed_file in parsed_files:
+            for entity in parsed_file.entities:
+                self.by_qualified_name[entity.qualified_name].append(entity)
+                if entity.kind == "Function" and entity.is_method:
+                    self.methods_by_name[entity.name].append(entity)
+            for base_ref in parsed_file.bases:
+                self._base_expressions.setdefault(base_ref.class_qn, (parsed_file, []))[1].append(base_ref.expr)
+
+        self._bindings_cache: dict[str, dict[str, Binding]] = {}
+        self._base_classes_cache: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------- module/imports
-    def resolve_module(self, dotted: str, from_module: str) -> str | None:
-        if dotted in self.modules:
-            return dotted
-        if dotted.split(".")[0] in STDLIB:
+    def resolve_module(self, dotted_name: str, from_module: str) -> str | None:
+        if dotted_name in self.modules:
+            return dotted_name
+        if dotted_name.split(".")[0] in STDLIB_MODULES:
             return None
-        cands = self.suffix_index.get(dotted, [])
-        if not cands:
+        candidates = self.suffix_index.get(dotted_name, [])
+        if not candidates:
             return None
-        if len(cands) == 1:
-            return cands[0]
-        src = from_module.split(".")
+        if len(candidates) == 1:
+            return candidates[0]
 
-        def common(m: str) -> int:
-            n = 0
-            for a, b in zip(m.split("."), src):
-                if a != b:
+        # Break ties by preferring the candidate with the longest common prefix with the importer.
+        source_parts = from_module.split(".")
+
+        def count_common_prefix_parts(module_qn: str) -> int:
+            common_count = 0
+            for module_part, source_part in zip(module_qn.split("."), source_parts):
+                if module_part != source_part:
                     break
-                n += 1
-            return n
+                common_count += 1
+            return common_count
 
-        return max(cands, key=common)
+        return max(candidates, key=count_common_prefix_parts)
 
-    def import_target(self, pf: ParsedFile, imp: ImportRef) -> str | None:
-        """Dotted module that `imp` refers to (None if external/unresolvable)."""
-        if imp.level > 0:
-            pkg = pf.module_qn.split(".") if pf.module_qn else []
-            if not pf.is_package:
-                pkg = pkg[:-1]
-            up = imp.level - 1
-            if up > len(pkg):
+    def import_target(self, parsed_file: ParsedFile, import_ref: ImportRef) -> str | None:
+        """Return the dotted module name that `import_ref` points to, or None if external/unresolvable."""
+        if import_ref.level > 0:
+            package_parts = parsed_file.module_qn.split(".") if parsed_file.module_qn else []
+            if not parsed_file.is_package:
+                package_parts = package_parts[:-1]
+            levels_up = import_ref.level - 1
+            if levels_up > len(package_parts):
                 return None
-            if up:
-                pkg = pkg[:-up]
-            return ".".join([*pkg, *([imp.module] if imp.module else [])])
-        return self.resolve_module(imp.module, pf.module_qn)
+            if levels_up:
+                package_parts = package_parts[:-levels_up]
+            return ".".join([*package_parts, *([import_ref.module] if import_ref.module else [])])
+        return self.resolve_module(import_ref.module, parsed_file.module_qn)
 
-    def _member(self, module_qn: str, name: str, depth: int) -> Binding | None:
-        qn = join_qn(module_qn, name)
-        if qn in self.by_qn:
-            return Binding("symbol", qn)
-        if qn in self.modules:
-            return Binding("module", qn)
+    def _lookup_member(self, module_qn: str, member_name: str, depth: int) -> Binding | None:
+        """Look up `member_name` inside `module_qn`, following re-exports up to MAX_REEXPORT_DEPTH."""
+        full_qn = join_qn(module_qn, member_name)
+        if full_qn in self.by_qualified_name:
+            return Binding("symbol", full_qn)
+        if full_qn in self.modules:
+            return Binding("module", full_qn)
         if depth < MAX_REEXPORT_DEPTH and module_qn in self.modules:
-            b = self.bindings(self.modules[module_qn]).get(name)
-            if b is not None and b.kind != "external":
-                return b
+            reexported_binding = self.bindings(self.modules[module_qn]).get(member_name)
+            if reexported_binding is not None and reexported_binding.kind != "external":
+                return reexported_binding
         return None
 
     def bindings(self, file_path: str) -> dict[str, Binding]:
-        if file_path in self._bindings:
-            return self._bindings[file_path]
-        out: dict[str, Binding] = {}
-        self._bindings[file_path] = out  # cycle guard
-        pf = self.files[file_path]
-        for imp in pf.imports:
-            if imp.name is None:  # import a.b [as c]
-                m = self.resolve_module(imp.module, pf.module_qn)
-                out[imp.alias or imp.module] = (
-                    Binding("module", m) if m else Binding("external", imp.module)
+        """Return the local-name → Binding map for a file (cached, cycle-safe)."""
+        if file_path in self._bindings_cache:
+            return self._bindings_cache[file_path]
+        result: dict[str, Binding] = {}
+        self._bindings_cache[file_path] = result  # cycle guard
+        parsed_file = self.files[file_path]
+        for import_ref in parsed_file.imports:
+            if import_ref.name is None:  # plain `import a.b [as c]`
+                resolved_module = self.resolve_module(import_ref.module, parsed_file.module_qn)
+                result[import_ref.alias or import_ref.module] = (
+                    Binding("module", resolved_module) if resolved_module
+                    else Binding("external", import_ref.module)
                 )
                 continue
-            key = imp.alias or imp.name
-            target = self.import_target(pf, imp)
-            b: Binding | None = None
-            if target is not None:
-                b = self._member(target, imp.name, 0)
+            local_name = import_ref.alias or import_ref.name
+            target_module = self.import_target(parsed_file, import_ref)
+            resolved_binding: Binding | None = None
+            if target_module is not None:
+                resolved_binding = self._lookup_member(target_module, import_ref.name, 0)
             else:
-                sub = self.resolve_module(join_qn(imp.module, imp.name), pf.module_qn)
-                if sub:
-                    b = Binding("module", sub)
-            out[key] = b or Binding("external", join_qn(imp.module, imp.name))
-        return out
-
-    # ----------------------------------------------------------------- classes
-    def class_entity(self, qn: str) -> Entity | None:
-        return next((e for e in self.by_qn.get(qn, []) if e.kind == "Class"), None)
-
-    def base_classes(self, class_qn: str) -> list[str]:
-        if class_qn in self._bases_cache:
-            return self._bases_cache[class_qn]
-        self._bases_cache[class_qn] = []
-        result: list[str] = []
-        if class_qn in self._base_exprs:
-            pf, exprs = self._base_exprs[class_qn]
-            for expr in exprs:
-                hit = self._lookup(expr.split("."), None, pf)
-                if isinstance(hit, Entity) and hit.kind == "Class":
-                    result.append(hit.qualified_name)
-        self._bases_cache[class_qn] = result
+                submodule = self.resolve_module(join_qn(import_ref.module, import_ref.name), parsed_file.module_qn)
+                if submodule:
+                    resolved_binding = Binding("module", submodule)
+            result[local_name] = resolved_binding or Binding("external", join_qn(import_ref.module, import_ref.name))
         return result
 
-    def find_method(self, class_qn: str, name: str, _seen: set[str] | None = None) -> Entity | None:
-        seen = _seen if _seen is not None else set()
-        if class_qn in seen:
+    # ----------------------------------------------------------------- classes
+    def class_entity(self, qualified_name: str) -> Entity | None:
+        return next(
+            (entity for entity in self.by_qualified_name.get(qualified_name, []) if entity.kind == "Class"),
+            None,
+        )
+
+    def base_classes(self, class_qn: str) -> list[str]:
+        if class_qn in self._base_classes_cache:
+            return self._base_classes_cache[class_qn]
+        self._base_classes_cache[class_qn] = []  # cycle guard
+        resolved_bases: list[str] = []
+        if class_qn in self._base_expressions:
+            parsed_file, base_expressions = self._base_expressions[class_qn]
+            for base_expression in base_expressions:
+                lookup_result = self._lookup(base_expression.split("."), None, parsed_file)
+                if isinstance(lookup_result, Entity) and lookup_result.kind == "Class":
+                    resolved_bases.append(lookup_result.qualified_name)
+        self._base_classes_cache[class_qn] = resolved_bases
+        return resolved_bases
+
+    def find_method(
+        self, class_qn: str, method_name: str, _visited: set[str] | None = None
+    ) -> Entity | None:
+        visited = _visited if _visited is not None else set()
+        if class_qn in visited:
             return None
-        seen.add(class_qn)
-        for e in self.by_qn.get(join_qn(class_qn, name), []):
-            if e.kind == "Function":
-                return e
-        for b in self.base_classes(class_qn):
-            hit = self.find_method(b, name, seen)
-            if hit:
-                return hit
+        visited.add(class_qn)
+        for entity in self.by_qualified_name.get(join_qn(class_qn, method_name), []):
+            if entity.kind == "Function":
+                return entity
+        for base_class_qn in self.base_classes(class_qn):
+            found = self.find_method(base_class_qn, method_name, visited)
+            if found:
+                return found
         return None
 
     # ------------------------------------------------------------------ lookup
-    def _apply_rest(self, ent: Entity, rest: list[str]) -> Entity | None:
-        if not rest:
-            return ent
-        if ent.kind == "Class" and len(rest) == 1:
-            return self.find_method(ent.qualified_name, rest[0])
+    def _apply_attribute_chain(self, entity: Entity, remaining_parts: list[str]) -> Entity | None:
+        """Descend into an entity using any remaining dotted parts after the resolved prefix."""
+        if not remaining_parts:
+            return entity
+        if entity.kind == "Class" and len(remaining_parts) == 1:
+            return self.find_method(entity.qualified_name, remaining_parts[0])
         return None
 
     def _lookup(
-        self, parts: list[str], caller: Entity | None, pf: ParsedFile,
+        self,
+        name_parts: list[str],
+        caller: Entity | None,
+        parsed_file: ParsedFile,
     ) -> Entity | str | None:
-        """Entity found, "external", or None (unknown)."""
-        head = parts[0]
-        # a. enclosing function scopes, then module level
-        scope = caller.local_qn.split(".") if caller else []
-        for i in range(len(scope), -1, -1):
-            prefix = ".".join(scope[:i])
-            if i > 0:
-                owners = self.by_qn.get(join_qn(pf.module_qn, prefix), [])
-                if not any(o.kind == "Function" for o in owners):
+        """Resolve a dotted name to an Entity, the string "external", or None (unknown)."""
+        head = name_parts[0]
+
+        # Strategy A: enclosing function scopes, then module level.
+        scope_parts = caller.local_qn.split(".") if caller else []
+        for depth in range(len(scope_parts), -1, -1):
+            scope_prefix = ".".join(scope_parts[:depth])
+            if depth > 0:
+                scope_owners = self.by_qualified_name.get(join_qn(parsed_file.module_qn, scope_prefix), [])
+                if not any(owner.kind == "Function" for owner in scope_owners):
                     continue
-            cands = self.by_qn.get(join_qn(pf.module_qn, ".".join([*scope[:i], head])), [])
-            if cands:
-                return self._apply_rest(cands[0], parts[1:])
-        # b. import bindings (longest dotted prefix first)
-        binds = self.bindings(pf.file_path)
-        for i in range(len(parts), 0, -1):
-            b = binds.get(".".join(parts[:i]))
-            if b is None:
+            scoped_qn = join_qn(parsed_file.module_qn, ".".join([*scope_parts[:depth], head]))
+            candidates = self.by_qualified_name.get(scoped_qn, [])
+            if candidates:
+                return self._apply_attribute_chain(candidates[0], name_parts[1:])
+
+        # Strategy B: import bindings — try longest dotted prefix first.
+        file_bindings = self.bindings(parsed_file.file_path)
+        for prefix_length in range(len(name_parts), 0, -1):
+            prefix_key = ".".join(name_parts[:prefix_length])
+            matched_binding = file_bindings.get(prefix_key)
+            if matched_binding is None:
                 continue
-            rest = parts[i:]
-            if b.kind == "external":
+            remaining_parts = name_parts[prefix_length:]
+            if matched_binding.kind == "external":
                 return "external"
-            if b.kind == "symbol":
-                return self._apply_rest(self.by_qn[b.value][0], rest)
-            cur = b.value
-            for j, name in enumerate(rest):
-                mem = self._member(cur, name, 0)
-                if mem is None:
+            if matched_binding.kind == "symbol":
+                return self._apply_attribute_chain(
+                    self.by_qualified_name[matched_binding.value][0], remaining_parts
+                )
+            # Follow a module chain
+            current_module = matched_binding.value
+            for attribute_index, attribute_name in enumerate(remaining_parts):
+                member_binding = self._lookup_member(current_module, attribute_name, 0)
+                if member_binding is None:
                     return None
-                if mem.kind == "module":
-                    cur = mem.value
+                if member_binding.kind == "module":
+                    current_module = member_binding.value
                     continue
-                return self._apply_rest(self.by_qn[mem.value][0], rest[j + 1:])
+                return self._apply_attribute_chain(
+                    self.by_qualified_name[member_binding.value][0],
+                    remaining_parts[attribute_index + 1:],
+                )
             return None
         return None
 
-    def _heuristic(self, name: str) -> list[tuple[Entity, str]]:
-        if name in COMMON_METHODS or name.startswith("__"):
+    def _heuristic_candidates(self, method_name: str) -> list[tuple[Entity, str]]:
+        """Return heuristic matches for an unresolved method name, or [] if too ambiguous."""
+        if method_name in COMMON_METHODS or method_name.startswith("__"):
             return []
-        cands = self.methods_by_name.get(name, [])
-        if 1 <= len(cands) <= MAX_HEURISTIC_CANDIDATES:
-            return [(c, "heuristic") for c in cands]
+        candidates = self.methods_by_name.get(method_name, [])
+        if 1 <= len(candidates) <= MAX_HEURISTIC_CANDIDATES:
+            return [(candidate, "heuristic") for candidate in candidates]
         return []
 
     def resolve_call(
-        self, expr: str, caller: Entity, pf: ParsedFile,
+        self,
+        call_expression: str,
+        caller: Entity,
+        parsed_file: ParsedFile,
     ) -> list[tuple[Entity, str]]:
-        parts = expr.split(".")
+        parts = call_expression.split(".")
+
         if parts[0] == "?":
-            return self._heuristic(parts[1])
+            return self._heuristic_candidates(parts[1])
+
         if parts[0] in ("self", "cls") and caller.class_qn:
             if len(parts) == 2:
-                m = self.find_method(caller.class_qn, parts[1])
-                if m:
-                    return [(m, "resolved")]
-            return self._heuristic(parts[-1]) if len(parts) > 1 else []
+                found_method = self.find_method(caller.class_qn, parts[1])
+                if found_method:
+                    return [(found_method, "resolved")]
+            return self._heuristic_candidates(parts[-1]) if len(parts) > 1 else []
+
         if parts[0] == "super" and caller.class_qn and len(parts) == 2:
-            for b in self.base_classes(caller.class_qn):
-                m = self.find_method(b, parts[1])
-                if m:
-                    return [(m, "resolved")]
+            for base_class_qn in self.base_classes(caller.class_qn):
+                found_method = self.find_method(base_class_qn, parts[1])
+                if found_method:
+                    return [(found_method, "resolved")]
             return []
 
-        hit = self._lookup(parts, caller, pf)
-        if isinstance(hit, Entity):
-            if hit.kind == "Class":  # instantiation -> __init__
-                init = self.find_method(hit.qualified_name, "__init__")
-                return [(init, "resolved")] if init else []
-            return [(hit, "resolved")]
-        if hit == "external":
+        lookup_result = self._lookup(parts, caller, parsed_file)
+        if isinstance(lookup_result, Entity):
+            if lookup_result.kind == "Class":  # instantiation → __init__
+                init_method = self.find_method(lookup_result.qualified_name, "__init__")
+                return [(init_method, "resolved")] if init_method else []
+            return [(lookup_result, "resolved")]
+        if lookup_result == "external":
             return []
-        return self._heuristic(parts[-1]) if len(parts) > 1 else []
-
+        return self._heuristic_candidates(parts[-1]) if len(parts) > 1 else []

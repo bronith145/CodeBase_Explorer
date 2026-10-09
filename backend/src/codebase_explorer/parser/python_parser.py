@@ -20,240 +20,276 @@ from codebase_explorer.models import (
     make_id,
 )
 
-_PY = Language(tspython.language())
-_DOTTED = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$")
-_HTTP_METHODS = {"get", "post", "put", "delete", "patch", "options", "head"}
-_DI_FUNCS = {"Depends", "Security"}
+PYTHON_LANGUAGE = Language(tspython.language())
+DOTTED_NAME_PATTERN = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$")
+HTTP_METHODS = {"get", "post", "put", "delete", "patch", "options", "head"}
+DEPENDENCY_INJECTION_FUNCS = {"Depends", "Security"}
 
 
 def module_qn_for(path: str) -> tuple[str, bool]:
     parts = list(PurePosixPath(path).with_suffix("").parts)
-    is_pkg = bool(parts) and parts[-1] == "__init__"
-    if is_pkg:
+    is_package = bool(parts) and parts[-1] == "__init__"
+    if is_package:
         parts = parts[:-1]
-    return ".".join(parts), is_pkg
+    return ".".join(parts), is_package
 
 
-def _t(node: Node) -> str:
+def node_text(node: Node) -> str:
+    """Decode a Tree-sitter node's source bytes to a string."""
     return (node.text or b"").decode("utf-8", "replace")
 
 
-def _string_value(node: Node | None) -> str | None:
+def extract_string_value(node: Node | None) -> str | None:
+    """Return the inner text of a Tree-sitter string node, or None."""
     if node is None or node.type != "string":
         return None
-    return "".join(_t(c) for c in node.children if c.type == "string_content")
+    return "".join(node_text(child) for child in node.children if child.type == "string_content")
 
 
 class PythonParser:
     def __init__(self, repo_id: str) -> None:
         self.repo_id = repo_id
-        self._parser = Parser(_PY)
+        self._parser = Parser(PYTHON_LANGUAGE)
 
     def parse_file(self, file_path: str, source: bytes) -> ParsedFile:
         tree = self._parser.parse(source)
-        module_qn, is_pkg = module_qn_for(file_path)
-        pf = ParsedFile(
+        module_qn, is_package = module_qn_for(file_path)
+        parsed_file = ParsedFile(
             file_path=file_path,
             module_qn=module_qn,
-            is_package=is_pkg,
+            is_package=is_package,
             file_hash=hashlib.sha256(source).hexdigest(),
             loc=source.count(b"\n") + 1,
         )
-        self._pf, self._src = pf, source
+        self._current_file = parsed_file
+        self._source = source
         self._walk(tree.root_node, (), None, None, False)
-        return pf
+        return parsed_file
 
     # ------------------------------------------------------------------ walk
     def _walk(
-        self, node: Node, scope: tuple[str, ...], cls: str | None,
-        caller: str | None, in_class: bool,
+        self,
+        node: Node,
+        scope: tuple[str, ...],
+        enclosing_class_qn: str | None,
+        caller_qn: str | None,
+        in_class_body: bool,
     ) -> None:
-        t = node.type
-        if t == "decorated_definition":
-            decos = [c for c in node.children if c.type == "decorator"]
-            d = node.child_by_field_name("definition")
-            if d is not None and d.type == "function_definition":
-                self._function(d, node, decos, scope, cls, in_class)
+        node_type = node.type
+        if node_type == "decorated_definition":
+            decorators = [child for child in node.children if child.type == "decorator"]
+            definition = node.child_by_field_name("definition")
+            if definition is not None and definition.type == "function_definition":
+                self._handle_function(definition, node, decorators, scope, enclosing_class_qn, in_class_body)
                 return
-            if d is not None and d.type == "class_definition":
-                self._class(d, node, scope)
+            if definition is not None and definition.type == "class_definition":
+                self._handle_class(definition, node, scope)
                 return
-        elif t == "function_definition":
-            self._function(node, node, [], scope, cls, in_class)
+        elif node_type == "function_definition":
+            self._handle_function(node, node, [], scope, enclosing_class_qn, in_class_body)
             return
-        elif t == "class_definition":
-            self._class(node, node, scope)
+        elif node_type == "class_definition":
+            self._handle_class(node, node, scope)
             return
-        elif t == "import_statement":
-            self._import(node)
+        elif node_type == "import_statement":
+            self._handle_import(node)
             return
-        elif t == "import_from_statement":
-            self._import_from(node)
+        elif node_type == "import_from_statement":
+            self._handle_import_from(node)
             return
-        elif t == "call":
-            self._call(node, caller)
-        for c in node.children:
-            self._walk(c, scope, cls, caller, False)
+        elif node_type == "call":
+            self._handle_call(node, caller_qn)
+        for child in node.children:
+            self._walk(child, scope, enclosing_class_qn, caller_qn, False)
 
     # ------------------------------------------------------------ definitions
     def _make_entity(
-        self, kind: str, node: Node, outer: Node, scope: tuple[str, ...],
-        cls: str | None, is_method: bool,
+        self,
+        kind: str,
+        definition_node: Node,
+        outer_node: Node,
+        scope: tuple[str, ...],
+        enclosing_class_qn: str | None,
+        is_method: bool,
     ) -> Entity:
-        name_node = node.child_by_field_name("name")
+        name_node = definition_node.child_by_field_name("name")
         assert name_node is not None
-        name = _t(name_node)
-        local = ".".join((*scope, name))
-        body = node.child_by_field_name("body")
-        end = body.start_byte if body is not None else node.end_byte
-        signature = self._src[node.start_byte:end].decode("utf-8", "replace").strip()
-        signature = signature.rstrip(":").strip()
+        name = node_text(name_node)
+        local_qn = ".".join((*scope, name))
+        body_node = definition_node.child_by_field_name("body")
+        signature_end_byte = body_node.start_byte if body_node is not None else definition_node.end_byte
+        raw_signature = self._source[definition_node.start_byte:signature_end_byte].decode("utf-8", "replace").strip()
+        clean_signature = " ".join(raw_signature.rstrip(":").strip().split())
         return Entity(
-            id=make_id(self.repo_id, kind, self._pf.file_path, local),
+            id=make_id(self.repo_id, kind, self._current_file.file_path, local_qn),
             kind=kind,
             name=name,
-            qualified_name=join_qn(self._pf.module_qn, local),
-            local_qn=local,
-            file_path=self._pf.file_path,
-            start_line=outer.start_point[0] + 1,
-            end_line=outer.end_point[0] + 1,
+            qualified_name=join_qn(self._current_file.module_qn, local_qn),
+            local_qn=local_qn,
+            file_path=self._current_file.file_path,
+            start_line=outer_node.start_point[0] + 1,
+            end_line=outer_node.end_point[0] + 1,
             repo_id=self.repo_id,
-            signature=" ".join(signature.split()),
-            docstring=self._docstring(body),
-            code=self._src[outer.start_byte:outer.end_byte].decode("utf-8", "replace"),
-            class_qn=cls,
+            signature=clean_signature,
+            docstring=self._extract_docstring(body_node),
+            code=self._source[outer_node.start_byte:outer_node.end_byte].decode("utf-8", "replace"),
+            class_qn=enclosing_class_qn,
             is_method=is_method,
         )
 
     @staticmethod
-    def _docstring(body: Node | None) -> str:
-        if body is None or not body.named_children:
+    def _extract_docstring(body_node: Node | None) -> str:
+        if body_node is None or not body_node.named_children:
             return ""
-        first = body.named_children[0]
-        if first.type == "expression_statement" and first.named_children:
-            val = _string_value(first.named_children[0])
-            if val is not None:
-                return val.strip()
+        first_statement = body_node.named_children[0]
+        if first_statement.type == "expression_statement" and first_statement.named_children:
+            string_value = extract_string_value(first_statement.named_children[0])
+            if string_value is not None:
+                return string_value.strip()
         return ""
 
-    def _function(
-        self, node: Node, outer: Node, decos: list[Node], scope: tuple[str, ...],
-        cls: str | None, in_class: bool,
+    def _handle_function(
+        self,
+        definition_node: Node,
+        outer_node: Node,
+        decorators: list[Node],
+        scope: tuple[str, ...],
+        enclosing_class_qn: str | None,
+        in_class_body: bool,
     ) -> None:
-        ent = self._make_entity("Function", node, outer, scope, cls, in_class and cls is not None)
-        self._pf.entities.append(ent)
-        for deco in decos:
-            self._route(deco, ent)
-        inner_scope = (*scope, ent.name)
-        for fld in ("parameters", "body"):
-            ch = node.child_by_field_name(fld)
-            if ch is not None:
-                self._walk(ch, inner_scope, cls, ent.qualified_name, False)
+        entity = self._make_entity(
+            "Function", definition_node, outer_node, scope,
+            enclosing_class_qn, in_class_body and enclosing_class_qn is not None,
+        )
+        self._current_file.entities.append(entity)
+        for decorator in decorators:
+            self._handle_route_decorator(decorator, entity)
+        inner_scope = (*scope, entity.name)
+        for field_name in ("parameters", "body"):
+            child_node = definition_node.child_by_field_name(field_name)
+            if child_node is not None:
+                self._walk(child_node, inner_scope, enclosing_class_qn, entity.qualified_name, False)
 
-    def _class(self, node: Node, outer: Node, scope: tuple[str, ...]) -> None:
-        ent = self._make_entity("Class", node, outer, scope, None, False)
-        self._pf.entities.append(ent)
-        sup = node.child_by_field_name("superclasses")
-        if sup is not None:
-            for c in sup.named_children:
-                if c.type in ("identifier", "attribute") and _DOTTED.match(_t(c)):
-                    self._pf.bases.append(BaseRef(ent.qualified_name, _t(c)))
-        body = node.child_by_field_name("body")
-        if body is not None:
-            for c in body.children:
-                self._walk(c, (*scope, ent.name), ent.qualified_name, None, True)
+    def _handle_class(self, definition_node: Node, outer_node: Node, scope: tuple[str, ...]) -> None:
+        entity = self._make_entity("Class", definition_node, outer_node, scope, None, False)
+        self._current_file.entities.append(entity)
+        superclasses_node = definition_node.child_by_field_name("superclasses")
+        if superclasses_node is not None:
+            for child in superclasses_node.named_children:
+                if child.type in ("identifier", "attribute") and DOTTED_NAME_PATTERN.match(node_text(child)):
+                    self._current_file.bases.append(BaseRef(entity.qualified_name, node_text(child)))
+        body_node = definition_node.child_by_field_name("body")
+        if body_node is not None:
+            for child in body_node.children:
+                self._walk(child, (*scope, entity.name), entity.qualified_name, None, True)
 
     # ----------------------------------------------------------------- routes
-    def _route(self, deco: Node, handler: Entity) -> None:
-        if not deco.named_children:
+    def _handle_route_decorator(self, decorator_node: Node, handler_entity: Entity) -> None:
+        if not decorator_node.named_children:
             return
-        expr = deco.named_children[0]
-        if expr.type != "call":
+        decorator_call = decorator_node.named_children[0]
+        if decorator_call.type != "call":
             return
-        fn = expr.child_by_field_name("function")
-        if fn is None or fn.type != "attribute":
+        function_node = decorator_call.child_by_field_name("function")
+        if function_node is None or function_node.type != "attribute":
             return
-        attr = fn.child_by_field_name("attribute")
-        if attr is None or _t(attr) not in _HTTP_METHODS:
+        attribute_node = function_node.child_by_field_name("attribute")
+        if attribute_node is None or node_text(attribute_node) not in HTTP_METHODS:
             return
-        args = expr.child_by_field_name("arguments")
-        first = args.named_children[0] if args is not None and args.named_children else None
-        path = _string_value(first)
-        if path is None:
+        arguments_node = decorator_call.child_by_field_name("arguments")
+        first_argument = arguments_node.named_children[0] if arguments_node is not None and arguments_node.named_children else None
+        route_path = extract_string_value(first_argument)
+        if route_path is None:
             return
-        self._pf.routes.append(
-            RouteDef(_t(attr).upper(), path, handler.qualified_name,
-                     self._pf.file_path, deco.start_point[0] + 1)
+        self._current_file.routes.append(
+            RouteDef(
+                node_text(attribute_node).upper(),
+                route_path,
+                handler_entity.qualified_name,
+                self._current_file.file_path,
+                decorator_node.start_point[0] + 1,
+            )
         )
 
     # ------------------------------------------------------------------ calls
-    def _expr(self, node: Node) -> str | None:
-        text = _t(node)
-        if node.type in ("identifier", "attribute") and _DOTTED.match(text):
+    def _normalise_call_expression(self, node: Node) -> str | None:
+        """Normalise a call-target node to a dotted string suitable for resolution."""
+        text = node_text(node)
+        if node.type in ("identifier", "attribute") and DOTTED_NAME_PATTERN.match(text):
             return text
         if node.type == "attribute":
-            attr = node.child_by_field_name("attribute")
-            obj = node.child_by_field_name("object")
-            if attr is None:
+            attribute_node = node.child_by_field_name("attribute")
+            object_node = node.child_by_field_name("object")
+            if attribute_node is None:
                 return None
-            if obj is not None and obj.type == "call":
-                f = obj.child_by_field_name("function")
-                if f is not None and _t(f) == "super":
-                    return f"super.{_t(attr)}"
-            return f"?.{_t(attr)}"
+            if object_node is not None and object_node.type == "call":
+                function_node = object_node.child_by_field_name("function")
+                if function_node is not None and node_text(function_node) == "super":
+                    return f"super.{node_text(attribute_node)}"
+            return f"?.{node_text(attribute_node)}"
         return None
 
-    def _call(self, node: Node, caller: str | None) -> None:
-        fn = node.child_by_field_name("function")
-        if caller is None or fn is None:
+    def _handle_call(self, call_node: Node, caller_qn: str | None) -> None:
+        function_node = call_node.child_by_field_name("function")
+        if caller_qn is None or function_node is None:
             return
-        line = node.start_point[0] + 1
-        expr = self._expr(fn)
-        if expr is None:
+        call_line = call_node.start_point[0] + 1
+        call_expression = self._normalise_call_expression(function_node)
+        if call_expression is None:
             return
-        self._pf.calls.append(CallSite(caller, expr, line))
-        if expr.split(".")[-1] in _DI_FUNCS:
-            args = node.child_by_field_name("arguments")
-            if args is not None:
-                for c in args.named_children:
-                    if c.type in ("identifier", "attribute"):
-                        dep = self._expr(c)
-                        if dep and not dep.startswith("?."):
-                            self._pf.calls.append(CallSite(caller, dep, line))
+        self._current_file.calls.append(CallSite(caller_qn, call_expression, call_line))
+        # Capture FastAPI Depends()/Security() dependency as an additional call edge
+        if call_expression.split(".")[-1] in DEPENDENCY_INJECTION_FUNCS:
+            arguments_node = call_node.child_by_field_name("arguments")
+            if arguments_node is not None:
+                for argument in arguments_node.named_children:
+                    if argument.type in ("identifier", "attribute"):
+                        dependency_expr = self._normalise_call_expression(argument)
+                        if dependency_expr and not dependency_expr.startswith("?."):
+                            self._current_file.calls.append(CallSite(caller_qn, dependency_expr, call_line))
                         break
 
     # ---------------------------------------------------------------- imports
-    def _import(self, node: Node) -> None:
-        line = node.start_point[0] + 1
-        for c in node.named_children:
-            if c.type == "dotted_name":
-                self._pf.imports.append(ImportRef(0, _t(c), None, None, line))
-            elif c.type == "aliased_import":
-                n, a = c.child_by_field_name("name"), c.child_by_field_name("alias")
-                if n is not None:
-                    self._pf.imports.append(
-                        ImportRef(0, _t(n), None, _t(a) if a is not None else None, line)
+    def _handle_import(self, import_node: Node) -> None:
+        line = import_node.start_point[0] + 1
+        for child in import_node.named_children:
+            if child.type == "dotted_name":
+                self._current_file.imports.append(ImportRef(0, node_text(child), None, None, line))
+            elif child.type == "aliased_import":
+                name_node = child.child_by_field_name("name")
+                alias_node = child.child_by_field_name("alias")
+                if name_node is not None:
+                    self._current_file.imports.append(
+                        ImportRef(0, node_text(name_node), None,
+                                  node_text(alias_node) if alias_node is not None else None, line)
                     )
 
-    def _import_from(self, node: Node) -> None:
-        line = node.start_point[0] + 1
-        mod = node.child_by_field_name("module_name")
-        level, module = 0, ""
-        if mod is not None:
-            if mod.type == "relative_import":
-                prefix = next((c for c in mod.children if c.type == "import_prefix"), None)
-                level = _t(prefix).count(".") if prefix is not None else 1
-                dn = next((c for c in mod.children if c.type == "dotted_name"), None)
-                module = _t(dn) if dn is not None else ""
+    def _handle_import_from(self, import_from_node: Node) -> None:
+        line = import_from_node.start_point[0] + 1
+        module_name_node = import_from_node.child_by_field_name("module_name")
+        relative_level, module_name = 0, ""
+        if module_name_node is not None:
+            if module_name_node.type == "relative_import":
+                import_prefix = next(
+                    (child for child in module_name_node.children if child.type == "import_prefix"), None
+                )
+                relative_level = node_text(import_prefix).count(".") if import_prefix is not None else 1
+                dotted_name_node = next(
+                    (child for child in module_name_node.children if child.type == "dotted_name"), None
+                )
+                module_name = node_text(dotted_name_node) if dotted_name_node is not None else ""
             else:
-                module = _t(mod)
-        for c in node.children_by_field_name("name"):
-            if c.type == "dotted_name":
-                self._pf.imports.append(ImportRef(level, module, _t(c), None, line))
-            elif c.type == "aliased_import":
-                n, a = c.child_by_field_name("name"), c.child_by_field_name("alias")
-                if n is not None:
-                    self._pf.imports.append(
-                        ImportRef(level, module, _t(n), _t(a) if a is not None else None, line)
+                module_name = node_text(module_name_node)
+        for imported_name in import_from_node.children_by_field_name("name"):
+            if imported_name.type == "dotted_name":
+                self._current_file.imports.append(
+                    ImportRef(relative_level, module_name, node_text(imported_name), None, line)
+                )
+            elif imported_name.type == "aliased_import":
+                name_node = imported_name.child_by_field_name("name")
+                alias_node = imported_name.child_by_field_name("alias")
+                if name_node is not None:
+                    self._current_file.imports.append(
+                        ImportRef(relative_level, module_name, node_text(name_node),
+                                  node_text(alias_node) if alias_node is not None else None, line)
                     )
-
